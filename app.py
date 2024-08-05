@@ -93,7 +93,7 @@ iface = gr.Interface(
     ],
     title="Kosmos 2.5 OCR and Markdown Generator",
     description="""Generate OCR results or Markdown from images using Kosmos 2.5.
-    Uses the Kosmos 2.5 [PR Branch] of the Transformers library for inference.
+    Uses the Kosmos 2.5 [PR Branch](https://github.com/huggingface/transformers/pull/31711) of the Transformers library for inference.
     I don't know if the parameters do much of anything, but they're available for tweaking just in case.""",
 )
 
