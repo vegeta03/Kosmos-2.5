@@ -1,103 +1,173 @@
 import torch
 from transformers import AutoConfig, AutoModelForVision2Seq, AutoProcessor
-from PIL import Image, ImageDraw
+from PIL import Image, ImageDraw, ImageSequence
 import re
 import gradio as gr
+import os
+import tempfile
+from functional import seq
+from dataclasses import dataclass
+from typing import Optional, List, Tuple, Dict, Any
 
-# Check for CUDA availability instead of assuming it
-device = "cuda" if torch.cuda.is_available() else "cpu"
+@dataclass
+class ProcessingConfig:
+    device: str = "cuda" if torch.cuda.is_available() else "cpu"
+    repo: str = "microsoft/kosmos-2.5"
+    dtype: torch.dtype = torch.float16 if torch.cuda.is_available() else torch.float32
 
-repo = "microsoft/kosmos-2.5"
-config = AutoConfig.from_pretrained(repo)
-dtype = torch.float16 if device == "cuda" else torch.float32
+@dataclass
+class PageResult:
+    page_num: int
+    image: Optional[Image.Image]
+    text: str
+    error: Optional[str] = None
 
-model = AutoModelForVision2Seq.from_pretrained(
-    repo, device_map=device, torch_dtype=dtype, config=config
-)
+class KosmosProcessor:
+    def __init__(self, config: ProcessingConfig):
+        self.config = config
+        self.model = self._initialize_model()
+        self.processor = AutoProcessor.from_pretrained(config.repo)
 
-processor = AutoProcessor.from_pretrained(repo)
+    def _initialize_model(self):
+        model_config = AutoConfig.from_pretrained(self.config.repo)
+        return AutoModelForVision2Seq.from_pretrained(
+            self.config.repo,
+            device_map=self.config.device,
+            torch_dtype=self.config.dtype,
+            config=model_config
+        )
 
-def process_image(image_path, task, num_beams, max_new_tokens, temperature):
-    try:
+    def process_page(self, page_data: Tuple[int, Image.Image], task: str, 
+                    num_beams: int, max_new_tokens: int, temperature: float) -> PageResult:
+        page_num, page = page_data
+        
+        try:
+            with tempfile.NamedTemporaryFile(suffix='.tiff', delete=True) as tmp_file:
+                page.save(tmp_file.name)
+                image_with_boxes, text_output = self._process_single_image(
+                    tmp_file.name, task, num_beams, max_new_tokens, temperature
+                )
+                return PageResult(page_num + 1, image_with_boxes, text_output)
+        except Exception as e:
+            return PageResult(page_num + 1, None, "", str(e))
+
+    def _process_single_image(self, image_path: str, task: str, 
+                            num_beams: int, max_new_tokens: int, 
+                            temperature: float) -> Tuple[Image.Image, str]:
         prompt = "<ocr>" if task == "OCR" else "<md>"
         image = Image.open(image_path)
-        inputs = processor(text=prompt, images=image, return_tensors="pt")
+        inputs = self._prepare_inputs(image, prompt)
+        
+        generated_text = self._generate_text(inputs, num_beams, max_new_tokens, temperature)
+        return self._postprocess_output(generated_text, inputs, image, prompt)
 
-        height, width = inputs.pop("height"), inputs.pop("width")
-        raw_width, raw_height = image.size
-        scale_height = raw_height / height
-        scale_width = raw_width / width
+    def _prepare_inputs(self, image: Image.Image, prompt: str) -> Dict[str, Any]:
+        inputs = self.processor(text=prompt, images=image, return_tensors="pt")
+        inputs['scale_factors'] = {
+            'height': image.size[1] / inputs.pop("height"),
+            'width': image.size[0] / inputs.pop("width")
+        }
+        inputs = {k: v.to(self.config.device) if isinstance(v, torch.Tensor) else v 
+                 for k, v in inputs.items()}
+        if self.config.device == "cuda":
+            inputs["flattened_patches"] = inputs["flattened_patches"].to(self.config.dtype)
+        return inputs
 
-        # Move inputs to appropriate device
-        inputs = {k: v.to(device) if v is not None else None for k, v in inputs.items()}
-        if device == "cuda":
-            inputs["flattened_patches"] = inputs["flattened_patches"].to(dtype)
-
-        with torch.cuda.amp.autocast() if device == "cuda" else torch.no_grad():
-            generated_ids = model.generate(
-                **inputs,
+    def _generate_text(self, inputs: Dict[str, Any], num_beams: int, 
+                      max_new_tokens: int, temperature: float) -> str:
+        context_manager = (torch.cuda.amp.autocast() if self.config.device == "cuda" 
+                         else torch.no_grad())
+        with context_manager:
+            generated_ids = self.model.generate(
+                **{k: v for k, v in inputs.items() if k != 'scale_factors'},
                 num_beams=num_beams,
                 max_new_tokens=max_new_tokens,
                 temperature=temperature,
             )
-        generated_text = processor.batch_decode(generated_ids, skip_special_tokens=True)[0]
+        return self.processor.batch_decode(generated_ids, skip_special_tokens=True)[0]
 
-        return postprocess(generated_text, scale_height, scale_width, image, prompt)
-    except Exception as e:
-        return None, f"Error processing image: {str(e)}"
+    def _postprocess_output(self, text: str, inputs: Dict[str, Any], 
+                          image: Image.Image, prompt: str) -> Tuple[Image.Image, str]:
+        # Existing postprocess logic converted to functional style
+        return (seq(text)
+                .map(lambda t: t.replace(prompt, ""))
+                .map(lambda t: self._process_bboxes(t, inputs['scale_factors'], image, prompt))
+                .head())
 
-def postprocess(y, scale_height, scale_width, original_image, prompt):
-    try:
-        y = y.replace(prompt, "")
-
+    def _process_bboxes(self, text: str, scale_factors: Dict[str, float], 
+                       image: Image.Image, prompt: str) -> Tuple[Image.Image, str]:
         if "<md>" in prompt:
-            return original_image, y
+            return image, text
 
         pattern = r"<bbox><x_\d+><y_\d+><x_\d+><y_\d+></bbox>"
-        bboxs_raw = re.findall(pattern, y)
+        bboxs_raw = re.findall(pattern, text)
+        lines = re.split(pattern, text)[1:]
+        
+        return (seq(zip(bboxs_raw, lines))
+                .map(lambda x: self._process_single_bbox(x, scale_factors, image))
+                .reduce(self._combine_bbox_results))
 
-        lines = re.split(pattern, y)[1:]
-        bboxs = [re.findall(r"\d+", i) for i in bboxs_raw]
-        bboxs = [[int(j) for j in i] for i in bboxs]
+    def _process_single_bbox(self, bbox_line: Tuple[str, str], 
+                           scale_factors: Dict[str, float], 
+                           image: Image.Image) -> Tuple[Image.Image, str]:
+        bbox_raw, line = bbox_line
+        coords = [int(x) for x in re.findall(r"\d+", bbox_raw)]
+        
+        if coords[0] >= coords[2] or coords[1] >= coords[3]:
+            return image, ""
 
-        info = ""
-        image_with_boxes = original_image.copy()
-        draw = ImageDraw.Draw(image_with_boxes)
+        scaled_coords = [
+            int(coords[0] * scale_factors['width']),
+            int(coords[1] * scale_factors['height']),
+            int(coords[2] * scale_factors['width']),
+            int(coords[3] * scale_factors['height'])
+        ]
+        
+        img_copy = image.copy()
+        ImageDraw.Draw(img_copy).rectangle(scaled_coords, outline="red", width=2)
+        
+        return img_copy, f"{scaled_coords[0]},{scaled_coords[1]},{scaled_coords[2]}," \
+               f"{scaled_coords[1]},{scaled_coords[2]},{scaled_coords[3]}," \
+               f"{scaled_coords[0]},{scaled_coords[3]},{line}\n"
 
-        for i in range(len(lines)):
-            box = bboxs[i]
-            x0, y0, x1, y1 = box
+    def _combine_bbox_results(self, acc: Tuple[Image.Image, str], 
+                            curr: Tuple[Image.Image, str]) -> Tuple[Image.Image, str]:
+        return curr[0], acc[1] + curr[1]
 
-            if not (x0 >= x1 or y0 >= y1):
-                x0 = int(x0 * scale_width)
-                y0 = int(y0 * scale_height)
-                x1 = int(x1 * scale_width)
-                y1 = int(y1 * scale_height)
-                info += f"{x0},{y0},{x1},{y0},{x1},{y1},{x0},{y1},{lines[i]}\n"
-                draw.rectangle([x0, y0, x1, y1], outline="red", width=2)
-
-        return image_with_boxes, info
+def process_multipage_tiff(image_path: str, task: str, num_beams: int, 
+                          max_new_tokens: int, temperature: float) -> Tuple[Image.Image, str]:
+    config = ProcessingConfig()
+    processor = KosmosProcessor(config)
+    
+    try:
+        with Image.open(image_path) as tiff_image:
+            results = (seq(enumerate(ImageSequence.Iterator(tiff_image)))
+                      .map(lambda page_data: processor.process_page(
+                           page_data, task, num_beams, max_new_tokens, temperature))
+                      .to_list())
+            
+            combined_output = (seq(results)
+                             .map(lambda r: f"\n=== Page {r.page_num} ===\n{r.text}\n")
+                             .reduce(lambda x, y: x + y))
+            
+            return results[0].image, combined_output
     except Exception as e:
-        return original_image, f"Error in postprocessing: {str(e)}"
+        return None, f"Error processing multi-page TIFF: {str(e)}"
 
+# Gradio interface remains the same
 iface = gr.Interface(
-    fn=process_image,
+    fn=process_multipage_tiff,
     inputs=[
-        gr.Image(type="filepath", label="Input Image"),
+        gr.Image(type="filepath", label="Input TIFF Image (Single or Multi-page)"),
         gr.Radio(["OCR", "Markdown"], label="Task", value="OCR"),
         gr.Slider(1, 10, value=4, step=1, label="Number of Beams"),
         gr.Slider(100, 4000, value=2048, step=100, label="Max New Tokens"),
         gr.Slider(0.1, 1.0, value=1.0, step=0.1, label="Temperature"),
     ],
     outputs=[
-        gr.Image(type="pil", label="Image with Bounding Boxes (OCR only)"),
-        gr.Textbox(label="Extracted Text / Markdown"),
+        gr.Image(type="pil", label="Image with Bounding Boxes (First page only)"),
+        gr.Textbox(label="Extracted Text / Markdown (All pages)"),
     ],
-    title="Kosmos 2.5 OCR and Markdown Generator",
-    description="""Generate OCR results or Markdown from images using Kosmos 2.5.
-    Uses the Kosmos 2.5 [PR Branch](https://github.com/huggingface/transformers/pull/31711) of the Transformers library for inference.
-    I don't know if the parameters do much of anything, but they're available for tweaking just in case.""",
+    title="Kosmos 2.5 OCR and Markdown Generator (Multi-page TIFF Support)",
+    description="""Generate OCR results or Markdown from single or multi-page TIFF images using Kosmos 2.5.""",
 )
-
-if __name__ == "__main__":
-    iface.launch()
