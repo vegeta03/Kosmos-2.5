@@ -1,7 +1,20 @@
 # Install the Kosmos 2.5 PR branch of Transformers.
 git+https://github.com/tic-top/transformers.git@main
 
-accelerate
-torch
-torchvision
-pillow
+# Core ML Dependencies
+torch>=2.2.0
+torchvision>=0.17.0
+accelerate>=0.27.0
+
+# Image Processing
+Pillow>=10.0.0
+
+# Functional Programming
+python-functional>=1.5.0
+
+# UI Interface
+gradio>=4.19.0
+
+# Optional: For CUDA support (uncomment if needed)
+# torch>=2.2.0+cu118
+# torchvision>=0.17.0+cu118
