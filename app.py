@@ -1,24 +1,76 @@
-import spaces
 import torch
 from transformers import AutoConfig, AutoModelForVision2Seq, AutoProcessor
 from PIL import Image, ImageDraw
 import re
 import gradio as gr
+from pathlib import Path
+import shutil
 
-repo = "microsoft/kosmos-2.5"
-device = "cuda"
+# Constants
+MODEL_REPO = "microsoft/kosmos-2.5"
+MODEL_CACHE_DIR = Path("./model_cache")
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+DTYPE = torch.float16
 
-config = AutoConfig.from_pretrained(repo)
-dtype = torch.float16
+def setup_model_directory():
+    """Create and setup model cache directory if it doesn't exist."""
+    MODEL_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    return MODEL_CACHE_DIR
 
-model = AutoModelForVision2Seq.from_pretrained(
-    repo, device_map=device, torch_dtype=dtype, config=config
-)
+def load_or_download_model():
+    """Load model from cache or download if not available."""
+    try:
+        # Setup cache directory
+        cache_dir = setup_model_directory()
+        
+        print(f"Loading model from {MODEL_REPO}...")
+        
+        # Load configuration
+        config = AutoConfig.from_pretrained(
+            MODEL_REPO,
+            cache_dir=cache_dir,
+            local_files_only=False
+        )
+        
+        # Load model with caching
+        model = AutoModelForVision2Seq.from_pretrained(
+            MODEL_REPO,
+            device_map=DEVICE,
+            torch_dtype=DTYPE,
+            config=config,
+            cache_dir=cache_dir,
+            local_files_only=False
+        )
+        
+        # Load processor with caching
+        processor = AutoProcessor.from_pretrained(
+            MODEL_REPO,
+            cache_dir=cache_dir,
+            local_files_only=False
+        )
+        
+        print("Model loaded successfully!")
+        return model, processor
+        
+    except Exception as e:
+        print(f"Error loading model: {str(e)}")
+        raise
 
-processor = AutoProcessor.from_pretrained(repo)
+def cleanup_cache():
+    """Cleanup temporary cache files."""
+    try:
+        cache_files = MODEL_CACHE_DIR.glob("**/tmp*")
+        for file in cache_files:
+            if file.is_file():
+                file.unlink()
+            elif file.is_dir():
+                shutil.rmtree(file)
+    except Exception as e:
+        print(f"Warning: Cache cleanup failed: {str(e)}")
 
+# Initialize model and processor
+model, processor = load_or_download_model()
 
-@spaces.GPU
 def process_image(image_path, task, num_beams, max_new_tokens, temperature):
     prompt = "<ocr>" if task == "OCR" else "<md>"
     image = Image.open(image_path)
@@ -29,8 +81,8 @@ def process_image(image_path, task, num_beams, max_new_tokens, temperature):
     scale_height = raw_height / height
     scale_width = raw_width / width
 
-    inputs = {k: v.to(device) if v is not None else None for k, v in inputs.items()}
-    inputs["flattened_patches"] = inputs["flattened_patches"].to(dtype)
+    inputs = {k: v.to(DEVICE) if v is not None else None for k, v in inputs.items()}
+    inputs["flattened_patches"] = inputs["flattened_patches"].to(DTYPE)
 
     generated_ids = model.generate(
         **inputs,
@@ -43,7 +95,6 @@ def process_image(image_path, task, num_beams, max_new_tokens, temperature):
     return postprocess(generated_text, scale_height, scale_width, image, prompt)
 
 
-@spaces.GPU
 def postprocess(y, scale_height, scale_width, original_image, prompt):
     y = y.replace(prompt, "")
 

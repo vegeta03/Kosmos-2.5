@@ -1,7 +1,9 @@
 # Install the Kosmos 2.5 PR branch of Transformers.
 git+https://github.com/tic-top/transformers.git@main
 
-accelerate
 torch
-torchvision
+transformers
 pillow
+gradio
+accelerate
+torchvision

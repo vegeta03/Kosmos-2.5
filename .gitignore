@@ -1,1 +1,3 @@
 venv/
+model_cache/
+.cursorignore
