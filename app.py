@@ -26,12 +26,12 @@ class KosmosProcessor:
     def __init__(self, config: ProcessingConfig):
         self.config = config
         self.model = self._initialize_model()
-        self.processor = AutoProcessor.from_pretrained(config.repo)
+        self.processor = AutoProcessor.from_pretrained("./model")  # Load from local directory
 
     def _initialize_model(self):
-        model_config = AutoConfig.from_pretrained(self.config.repo)
+        model_config = AutoConfig.from_pretrained("./model")  # Load from local directory
         return AutoModelForVision2Seq.from_pretrained(
-            self.config.repo,
+            "./model",  # Load from local directory
             device_map=self.config.device,
             torch_dtype=self.config.dtype,
             config=model_config
